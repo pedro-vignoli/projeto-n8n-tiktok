@@ -1,0 +1,11 @@
+.env
+*.env
+!.env.example
+credentials*.json
+tiktok.json
+*.pem
+*.key
+.vscode/
+.idea/
+node_modules/
+*.ok

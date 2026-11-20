@@ -1,0 +1,140 @@
+[
+  {
+    "name": "Post to TikTok",
+    "nodes": [
+      {
+        "id": "t1",
+        "name": "Start",
+        "type": "n8n-nodes-base.manualTrigger",
+        "typeVersion": 1,
+        "position": [
+          0,
+          0
+        ],
+        "parameters": {}
+      },
+      {
+        "id": "t2",
+        "name": "List videos",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          220,
+          0
+        ],
+        "parameters": {
+          "jsCode": "// Lists today's videos that were not posted to TikTok yet.\n// Folder layout: /data/videos/Posts/<YYYY-MM-DD>/*.mp4\nconst fs = require('fs');\n\nconst TIMEZONE = 'UTC'; // change to your time zone, e.g. 'America/New_York'\nconst BASE = '/data/videos/Posts';\n\nconst today = new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE }).format(new Date());\nconst dir = BASE + '/' + today;\nif (!fs.existsSync(dir)) return [];\n\nlet tags = '';\ntry {\n  tags = fs.readFileSync(BASE + '/tags-tiktok.txt', 'utf8').replace(/\\s+/g, ' ').trim();\n} catch (e) {}\n\nconst items = [];\nfor (const file of fs.readdirSync(dir).sort()) {\n  if (!file.toLowerCase().endsWith('.mp4')) continue;\n  const name = file.slice(0, -4);\n  const marker = dir + '/' + name + '.tiktok.ok';\n  if (fs.existsSync(marker)) continue;\n  items.push({ json: { dir, file, path: dir + '/' + file, name, marker, tags } });\n}\nreturn items;\n"
+        }
+      },
+      {
+        "id": "t3",
+        "name": "Get token",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          440,
+          0
+        ],
+        "parameters": {
+          "jsCode": "// Returns a valid access token, refreshing it with the saved refresh_token when needed.\n// The token file is created by scripts/authorize.js.\nconst fs = require('fs');\nconst https = require('https');\n\nconst TOKEN_FILE = '/home/node/.n8n/tiktok.json';\n\nlet creds;\ntry {\n  creds = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));\n} catch (e) {\n  throw new Error('Missing ' + TOKEN_FILE + ': run scripts/authorize.js first');\n}\n\nconst post = (url, body) => new Promise((resolve, reject) => {\n  const req = https.request(url, {\n    method: 'POST',\n    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) }\n  }, res => {\n    const parts = [];\n    res.on('data', d => parts.push(d));\n    res.on('end', () => resolve(JSON.parse(Buffer.concat(parts).toString())));\n  });\n  req.on('error', reject);\n  req.end(body);\n});\n\nif (!creds.access_token || Date.now() > creds.expires_at - 60000) {\n  const r = await post('https://open.tiktokapis.com/v2/oauth/token/', new URLSearchParams({\n    client_key: creds.client_key,\n    client_secret: creds.client_secret,\n    grant_type: 'refresh_token',\n    refresh_token: creds.refresh_token\n  }).toString());\n  if (!r.access_token) throw new Error('TikTok refused the refresh: ' + JSON.stringify(r));\n  creds.access_token = r.access_token;\n  creds.refresh_token = r.refresh_token || creds.refresh_token;\n  creds.expires_at = Date.now() + r.expires_in * 1000;\n  fs.writeFileSync(TOKEN_FILE, JSON.stringify(creds, null, 2));\n}\n\nreturn $input.all().map(i => ({ json: { ...i.json, access_token: creds.access_token } }));\n"
+        }
+      },
+      {
+        "id": "t4",
+        "name": "Each video",
+        "type": "n8n-nodes-base.splitInBatches",
+        "typeVersion": 3,
+        "position": [
+          660,
+          0
+        ],
+        "parameters": {
+          "batchSize": 1,
+          "options": {}
+        }
+      },
+      {
+        "id": "t5",
+        "name": "Post video",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          880,
+          100
+        ],
+        "onError": "continueErrorOutput",
+        "parameters": {
+          "jsCode": "// Posts one video: init -> upload -> status check -> marker file.\nconst fs = require('fs');\nconst https = require('https');\n\nconst item = $input.first().json;\n\n// An app that has not passed the TikTok audit can only post with SELF_ONLY.\n// After approval, change it to 'PUBLIC_TO_EVERYONE'.\nconst PRIVACY = 'SELF_ONLY';\n\nconst request = (url, method, headers, body) => new Promise((resolve, reject) => {\n  const req = https.request(url, { method, headers: { ...headers, 'Content-Length': body.length } }, res => {\n    const parts = [];\n    res.on('data', d => parts.push(d));\n    res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(parts).toString() }));\n  });\n  req.on('error', reject);\n  req.end(body);\n});\n\nconst api = async (url, body) => {\n  const r = await request(url, 'POST', {\n    Authorization: 'Bearer ' + item.access_token,\n    'Content-Type': 'application/json; charset=UTF-8'\n  }, Buffer.from(JSON.stringify(body)));\n  return JSON.parse(r.text);\n};\n\nconst video = fs.readFileSync(item.path);\nconst size = video.length;\nconst chunk = size <= 64 * 1024 * 1024 ? size : 50 * 1024 * 1024;\nconst chunks = Math.floor(size / chunk);\n\nconst init = await api('https://open.tiktokapis.com/v2/post/publish/video/init/', {\n  post_info: { title: item.tags, privacy_level: PRIVACY, disable_duet: false, disable_comment: false, disable_stitch: false },\n  source_info: { source: 'FILE_UPLOAD', video_size: size, chunk_size: chunk, total_chunk_count: chunks }\n});\nif (!init.data || !init.data.upload_url) throw new Error('init failed: ' + JSON.stringify(init));\nconst { upload_url, publish_id } = init.data;\n\nfor (let i = 0; i < chunks; i++) {\n  const start = i * chunk;\n  const end = i === chunks - 1 ? size : start + chunk;\n  const r = await request(upload_url, 'PUT', {\n    'Content-Type': 'video/mp4',\n    'Content-Range': 'bytes ' + start + '-' + (end - 1) + '/' + size\n  }, video.subarray(start, end));\n  if (r.status >= 300) throw new Error('upload failed: ' + r.status + ' ' + r.text);\n}\n\nlet status = '';\nfor (let attempt = 0; attempt < 12; attempt++) {\n  await new Promise(r => setTimeout(r, 10000));\n  const s = await api('https://open.tiktokapis.com/v2/post/publish/status/fetch/', { publish_id });\n  status = (s.data && s.data.status) || '';\n  if (status === 'PUBLISH_COMPLETE') break;\n  if (status === 'FAILED') throw new Error('TikTok failed: ' + JSON.stringify(s.data));\n}\n\nfs.writeFileSync(item.marker, new Date().toISOString() + ' ' + publish_id + ' ' + status + '\\n');\nreturn [{ json: { file: item.file, publish_id, status } }];\n"
+        }
+      }
+    ],
+    "connections": {
+      "Start": {
+        "main": [
+          [
+            {
+              "node": "List videos",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "List videos": {
+        "main": [
+          [
+            {
+              "node": "Get token",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Get token": {
+        "main": [
+          [
+            {
+              "node": "Each video",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Each video": {
+        "main": [
+          [],
+          [
+            {
+              "node": "Post video",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Post video": {
+        "main": [
+          [
+            {
+              "node": "Each video",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Each video",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1"
+    }
+  }
+]
